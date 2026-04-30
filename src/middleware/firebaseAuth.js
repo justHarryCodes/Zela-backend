@@ -22,6 +22,41 @@
 import { initializeApp, getApps, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 
+// ─── Internal logger ──────────────────────────────────────────────────────────
+
+const log = {
+  info: (msg, meta = {}) =>
+    console.log(
+      JSON.stringify({
+        level: "info",
+        service: "firebaseAuth",
+        msg,
+        ...meta,
+        ts: new Date().toISOString(),
+      }),
+    ),
+  warn: (msg, meta = {}) =>
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        service: "firebaseAuth",
+        msg,
+        ...meta,
+        ts: new Date().toISOString(),
+      }),
+    ),
+  error: (msg, meta = {}) =>
+    console.error(
+      JSON.stringify({
+        level: "error",
+        service: "firebaseAuth",
+        msg,
+        ...meta,
+        ts: new Date().toISOString(),
+      }),
+    ),
+};
+
 // ─── Initialise once ──────────────────────────────────────────────────────────
 
 function initAdmin() {
@@ -30,15 +65,25 @@ function initAdmin() {
   // If a full service account JSON is provided as an env var (common on
   // platforms like Railway that don't support file mounts):
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    const serviceAccount = JSON.parse(
-      process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
-    );
+    let serviceAccount;
+    try {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } catch {
+      // A malformed JSON value here means the app cannot authenticate at all —
+      // fail fast at boot with a clear message rather than a cryptic runtime error.
+      throw new Error(
+        "[firebaseAuth] FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON. " +
+          "Check the env var for unescaped quotes or truncation.",
+      );
+    }
     initializeApp({ credential: cert(serviceAccount) });
+    log.info("Firebase Admin initialised with service account JSON");
     return;
   }
 
-  // Otherwise fall back to ADC (Cloud Run, GKE, local with GOOGLE_APPLICATION_CREDENTIALS)
-  initializeApp({
+  // Fall back to ADC (Cloud Run, GKE, local with GOOGLE_APPLICATION_CREDENTIALS)
+  initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID });
+  log.info("Firebase Admin initialised with Application Default Credentials", {
     projectId: process.env.FIREBASE_PROJECT_ID,
   });
 }
@@ -50,8 +95,10 @@ const adminAuth = getAuth();
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
 /**
- * @param {import('express').Request}  req
- * @param {import('express').Response} res
+ * Export name and signature unchanged — server.js and all routes work as-is.
+ *
+ * @param {import('express').Request}      req
+ * @param {import('express').Response}     res
  * @param {import('express').NextFunction} next
  */
 export async function requireFirebaseAuth(req, res, next) {
@@ -70,12 +117,14 @@ export async function requireFirebaseAuth(req, res, next) {
     req.firebaseUid = decoded.uid;
     next();
   } catch (err) {
-    // Firebase errors have a code property; log it for debugging without
-    // leaking details to the caller.
-    console.warn(
-      "[firebaseAuth] Token verification failed:",
-      err.code ?? err.message,
-    );
+    // Log the Firebase error code (e.g. auth/id-token-expired) for debugging.
+    // The error code is safe to log — it does not contain token material.
+    // Never send the code to the caller; it reveals which check failed.
+    log.warn("Token verification failed", {
+      code: err.code ?? "unknown",
+      method: req.method,
+      path: req.path,
+    });
     return res.status(401).json({ error: "Invalid or expired token." });
   }
 }

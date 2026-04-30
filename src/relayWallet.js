@@ -1,30 +1,33 @@
 /**
- * src/feePayer.js
+ * src/relayWallet.js
  *
- * Loads the fee payer Keypair exactly once at process start.
- * All other modules import { feePayer, feePayerPublicKey } from here.
+ * Loads the private-pay relay Keypair exactly once at process start.
+ * All Umbra SDK operations are signed with this keypair.
  *
- * The secret key is stored as a base58-encoded string in the environment
- * variable FEE_PAYER_SECRET_KEY. Never commit this value to source control.
+ * The relay wallet:
+ *   • Receives stablecoins from senders (via sponsored transactions)
+ *   • Signs Umbra mixer deposits on behalf of recipients
+ *   • Must hold sufficient SOL for Umbra transaction gas (~0.005 SOL per op)
+ *   • Must have initialised ATAs for USDC, USDT, and USDG before use
  *
- * To generate a new fee payer wallet:
+ * IMPORTANT: Fund this wallet with SOL and initialise its ATAs before
+ * deploying to mainnet. Monitor the SOL balance in /health/deep.
+ *
+ * To generate a new relay wallet:
  *   node -e "
  *     const { Keypair } = require('@solana/web3.js');
  *     const bs58 = require('bs58');
  *     const kp = Keypair.generate();
  *     console.log('Public key:', kp.publicKey.toBase58());
- *     console.log('Secret key (store in env):', bs58.encode(kp.secretKey));
+ *     console.log('Secret key:', bs58.encode(kp.secretKey));
  *   "
  *
- * Then fund the public key with SOL on mainnet before deploying.
- * Monitor the balance via /health — add alerting when it drops below ~0.1 SOL.
- *
  * Exports (unchanged):
- *   feePayer            — Keypair (used for signing transactions)
- *   feePayerPublicKey   — Base58 string
+ *   relayWallet      — Keypair (used for signing Umbra transactions)
+ *   relayPublicKey   — Base58 string
  *
  * New additive export:
- *   getFeePayerBalance  — async fn(connection) → SOL balance as number
+ *   getRelayBalance  — async fn(connection) → SOL balance as number
  */
 
 import { Keypair, LAMPORTS_PER_SOL } from "@solana/web3.js";
@@ -37,7 +40,7 @@ const log = {
     console.log(
       JSON.stringify({
         level: "info",
-        service: "feePayer",
+        service: "relayWallet",
         msg,
         ...meta,
         ts: new Date().toISOString(),
@@ -47,7 +50,7 @@ const log = {
     console.error(
       JSON.stringify({
         level: "error",
-        service: "feePayer",
+        service: "relayWallet",
         msg,
         ...meta,
         ts: new Date().toISOString(),
@@ -57,13 +60,13 @@ const log = {
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
 
-function loadFeePayer() {
+function loadRelayWallet() {
   // ── 1. Presence check — fastest possible failure ──────────────────────────
-  const raw = process.env.FEE_PAYER_SECRET_KEY;
+  const raw = process.env.PRIVATE_PAY_RELAY_SECRET_KEY;
   if (!raw) {
     throw new Error(
-      "[feePayer] FEE_PAYER_SECRET_KEY is not set. " +
-        "Generate with: node -e \"console.log(require('bs58').encode(require('@solana/web3.js').Keypair.generate().secretKey))\"",
+      "[relayWallet] PRIVATE_PAY_RELAY_SECRET_KEY is not set.\n" +
+        "Generate a new keypair and add it to your .env file.",
     );
   }
 
@@ -73,8 +76,8 @@ function loadFeePayer() {
     secretKey = bs58.decode(raw);
   } catch {
     throw new Error(
-      "[feePayer] FEE_PAYER_SECRET_KEY is not valid base58. " +
-        "Re-generate the keypair and update your environment.",
+      "[relayWallet] PRIVATE_PAY_RELAY_SECRET_KEY is not valid base58. " +
+        "Ensure it is a full base58-encoded Solana secret key.",
     );
   }
 
@@ -83,7 +86,7 @@ function loadFeePayer() {
   // Checked before Keypair.fromSecretKey so the error is immediately clear.
   if (secretKey.length !== 64) {
     throw new Error(
-      `[feePayer] FEE_PAYER_SECRET_KEY decoded to ${secretKey.length} bytes — ` +
+      `[relayWallet] PRIVATE_PAY_RELAY_SECRET_KEY decoded to ${secretKey.length} bytes — ` +
         "expected 64. Ensure you are using the full secret key, not just the seed.",
     );
   }
@@ -93,30 +96,30 @@ function loadFeePayer() {
   try {
     keypair = Keypair.fromSecretKey(secretKey);
   } catch (err) {
-    throw new Error(`[feePayer] Failed to create Keypair: ${err.message}`);
+    throw new Error(`[relayWallet] Failed to create Keypair: ${err.message}`);
   }
 
-  // secretKey bytes and process.env.FEE_PAYER_SECRET_KEY are intentionally
-  // kept alive — this wallet signs transactions throughout the process lifetime.
+  // secretKey bytes and process.env.PRIVATE_PAY_RELAY_SECRET_KEY are intentionally
+  // kept alive — this wallet signs Umbra transactions throughout the process lifetime.
 
-  log.info("Fee payer loaded", { publicKey: keypair.publicKey.toBase58() });
+  log.info("Relay wallet loaded", { publicKey: keypair.publicKey.toBase58() });
 
   return keypair;
 }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
-export const feePayer = loadFeePayer();
-export const feePayerPublicKey = feePayer.publicKey.toBase58();
+export const relayWallet = loadRelayWallet();
+export const relayPublicKey = relayWallet.publicKey.toBase58();
 
 /**
- * Returns the current SOL balance of the fee payer wallet.
- * Plug into /health or /metrics.
+ * Returns the current SOL balance of the relay wallet.
+ * Plug into /health/deep.
  *
  * @param {import("@solana/web3.js").Connection} connection
  * @returns {Promise<number>} balance in SOL
  */
-export async function getFeePayerBalance(connection) {
-  const lamports = await connection.getBalance(feePayer.publicKey);
+export async function getRelayBalance(connection) {
+  const lamports = await connection.getBalance(relayWallet.publicKey);
   return lamports / LAMPORTS_PER_SOL;
 }

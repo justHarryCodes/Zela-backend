@@ -1,7 +1,7 @@
 {
-  "name": "zela-fee-payer",
+  "name": "zela-backend",
   "version": "1.0.0",
-  "description": "Gas fee sponsorship backend for Zela — co-signs Solana transactions as fee payer.",
+  "description": "Gas fee sponsorship + Reloadly services backend for Zela — co-signs Solana transactions, processes airtime/data/utility/giftcard payments.",
   "type": "module",
   "main": "src/index.js",
   "engines": {
@@ -9,16 +9,37 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "migrate": "node src/db/migrate.js --migrate",
+    "migrate:status": "node src/db/migrate.js --status",
+    "migrate:redo": "node src/db/migrate.js --redo",
+    "updatedb": "cd node_modules/geoip-lite && npm run-script updatedb license_key=$MAXMIND_LICENSE_KEY",
+    "updatedb:force": "cd node_modules/geoip-lite && npm run-script updatedb-force license_key=$MAXMIND_LICENSE_KEY"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.98.0",
+    "@jup-ag/api": "^6.0.48",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "@umbra-privacy/sdk": "^4.0.0",
+    "@umbra-privacy/web-zk-prover": "^2.0.1",
     "bs58": "^6.0.0",
+    "compression": "^1.8.1",
     "cors": "^2.8.6",
+    "crypto-js": "^4.2.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "express-rate-limit": "^7.4.1",
+    "ffjavascript": "^0.3.1",
     "firebase-admin": "^13.0.0",
-    "helmet": "^8.0.0"
+    "geoip-lite": "^1.4.10",
+    "helmet": "^8.0.0",
+    "mongoose": "^9.5.0",
+    "node-cron": "^3.0.3",
+    "os": "^0.1.2",
+    "pg": "^8.20.0",
+    "snarkjs": "^0.7.6",
+    "tweetnacl": "^1.0.3",
+    "twilio": "^6.0.0",
+    "zod": "^3.23.8"
   }
 }

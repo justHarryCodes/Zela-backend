@@ -43,17 +43,76 @@
  *   -32601 "Method not found" and the SDK falls back to block-height polling
  *   which races against blockhash expiry and loses.
  *
- *   Polling via getSignatureStatuses is pure HTTP, always works on Alchemy,
- *   and gives us fine-grained control over timeout and retry cadence.
- *
- *   The blockhash used for expiry tracking is the one INSIDE the transaction
- *   (set by the client before signing). Fetching a new blockhash after
- *   broadcast — as the previous version did — would track the wrong window.
+ *   Blockhash validity is checked with isBlockhashValid() against the
+ *   TRANSACTION's own blockhash on each poll tick. The previous approach of
+ *   calling getLatestBlockhash() and using its lastValidBlockHeight was
+ *   incorrect — that window belongs to the freshly-fetched hash, not to the
+ *   (possibly older) hash the client embedded in the transaction, causing
+ *   expiry to be over-estimated by up to ~30 seconds.
  */
 
 import { Transaction, PublicKey, Connection } from "@solana/web3.js";
-
 import { feePayer, feePayerPublicKey } from "../feePayer.js";
+
+// ─── Internal logger ──────────────────────────────────────────────────────────
+
+const log = {
+  info: (msg, meta = {}) =>
+    console.log(
+      JSON.stringify({
+        level: "info",
+        service: "sponsor",
+        msg,
+        ...meta,
+        ts: new Date().toISOString(),
+      }),
+    ),
+  warn: (msg, meta = {}) =>
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        service: "sponsor",
+        msg,
+        ...meta,
+        ts: new Date().toISOString(),
+      }),
+    ),
+  error: (msg, meta = {}) =>
+    console.error(
+      JSON.stringify({
+        level: "error",
+        service: "sponsor",
+        msg,
+        ...meta,
+        ts: new Date().toISOString(),
+      }),
+    ),
+};
+
+// ─── Typed internal errors ────────────────────────────────────────────────────
+//
+// Subclasses instead of string matching on err.message — survives SDK updates
+// that change error wording without breaking error categorisation.
+
+class BlockhashExpiredError extends Error {
+  constructor(msg) {
+    super(msg);
+    this.name = "BlockhashExpiredError";
+  }
+}
+class ConfirmationTimeoutError extends Error {
+  constructor(msg) {
+    super(msg);
+    this.name = "ConfirmationTimeoutError";
+  }
+}
+class OnChainError extends Error {
+  constructor(solanaErr) {
+    super("Transaction failed on-chain");
+    this.name = "OnChainError";
+    this.solanaErr = solanaErr; // kept for internal logging only — never sent to client
+  }
+}
 
 // ─── Solana connection (singleton) ────────────────────────────────────────────
 
@@ -81,17 +140,14 @@ const ALLOWED_PROGRAMS = new Set([
 
 // ─── Instruction limit ────────────────────────────────────────────────────────
 //
-// Each routed token now produces up to 4 instructions:
+// Each routed token produces up to 4 instructions:
 //   1. createAssociatedTokenAccount for the recipient   (if ATA is new)
 //   2. createAssociatedTokenAccount for the fee wallet  (if ATA is new)
 //   3. transfer → recipient
 //   4. transfer → fee wallet
 //
-// With 3 tokens routed and both ATAs brand-new on every step:
-//   3 tokens × 4 instructions = 12 max
-//
-// We set the ceiling to 14 to keep a 2-instruction safety margin without
-// opening the door to unrelated instruction injection.
+// 3 tokens × 4 instructions = 12 max; ceiling set to 14 for a 2-instruction margin.
+
 const MAX_INSTRUCTIONS = 14;
 
 // ─── Confirmation via HTTP polling ────────────────────────────────────────────
@@ -100,29 +156,36 @@ const POLL_INTERVAL_MS = 2_000;
 const POLL_TIMEOUT_MS = 60_000;
 
 /**
- * Polls getSignatureStatuses() until the transaction reaches the target
- * commitment level or the blockhash expires, whichever comes first.
+ * Polls getSignatureStatuses() until the transaction confirms or its blockhash
+ * expires, whichever comes first.
+ *
+ * Uses isBlockhashValid() against the transaction's own blockhash rather than
+ * fetching a fresh blockhash and using its lastValidBlockHeight — those two
+ * expiry windows can differ by up to ~150 blocks.
  *
  * @param {string} signature
- * @param {string} blockhash
- * @param {number} lastValidBlockHeight
+ * @param {string} txBlockhash   The recentBlockhash embedded in the transaction
  * @param {'confirmed'|'finalized'} [commitment='confirmed']
  * @returns {Promise<void>}
  */
 async function pollForConfirmation(
   signature,
-  blockhash,
-  lastValidBlockHeight,
+  txBlockhash,
   commitment = "confirmed",
 ) {
   const deadline = Date.now() + POLL_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
-    const currentHeight = await connection.getBlockHeight("confirmed");
-    if (currentHeight > lastValidBlockHeight) {
-      throw new Error(
-        `Transaction blockhash expired at block height ${lastValidBlockHeight} ` +
-          `(current: ${currentHeight}). Rebuild and resubmit.`,
+    // Cheapest failure path — bail out the moment the blockhash is no longer valid.
+    const { value: isValid } = await connection.isBlockhashValid(txBlockhash, {
+      commitment: "confirmed",
+    });
+
+    if (!isValid) {
+      throw new BlockhashExpiredError(
+        "Transaction blockhash has expired. " +
+          "The transaction was not confirmed within the ~150-block validity window. " +
+          "Rebuild and resubmit.",
       );
     }
 
@@ -134,9 +197,9 @@ async function pollForConfirmation(
 
     if (status) {
       if (status.err) {
-        throw new Error(
-          `Transaction failed on-chain: ${JSON.stringify(status.err)}`,
-        );
+        // Carry the raw Solana error for server-side logging only.
+        // The route handler sends a sanitised message to the client.
+        throw new OnChainError(status.err);
       }
 
       const reached =
@@ -151,20 +214,23 @@ async function pollForConfirmation(
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
 
-  throw new Error(
-    `Confirmation timeout: transaction ${signature} was not confirmed within ` +
-      `${POLL_TIMEOUT_MS / 1000} seconds.`,
+  throw new ConfirmationTimeoutError(
+    `Transaction ${signature} was not confirmed within ${POLL_TIMEOUT_MS / 1000} seconds.`,
   );
 }
 
 // ─── Route handler ────────────────────────────────────────────────────────────
 
 /**
+ * Export name and signature unchanged — server.js and tests need no updates.
+ *
  * @param {import('express').Request}      req
  * @param {import('express').Response}     res
  * @param {import('express').NextFunction} next
  */
 export async function sponsorTransaction(req, res, next) {
+  const startMs = Date.now();
+
   try {
     const { transaction: txBase64, senderPublicKey: senderPubKeyStr } =
       req.body;
@@ -194,8 +260,7 @@ export async function sponsorTransaction(req, res, next) {
 
     let tx;
     try {
-      const txBuffer = Buffer.from(txBase64, "base64");
-      tx = Transaction.from(txBuffer);
+      tx = Transaction.from(Buffer.from(txBase64, "base64"));
     } catch {
       return res
         .status(400)
@@ -210,9 +275,6 @@ export async function sponsorTransaction(req, res, next) {
         .status(400)
         .json({ error: "transaction is missing recentBlockhash." });
     }
-
-    const blockhashInfo = await connection.getLatestBlockhash("confirmed");
-    const lastValidBlockHeight = blockhashInfo.lastValidBlockHeight;
 
     // ── Guard: fee payer must be our wallet ───────────────────────────────
 
@@ -239,7 +301,12 @@ export async function sponsorTransaction(req, res, next) {
     for (const ix of tx.instructions) {
       const programId = ix.programId.toBase58();
       if (!ALLOWED_PROGRAMS.has(programId)) {
-        console.warn(`[sponsor] ✗ REJECTED program: ${programId}`);
+        // Log with uid + sender so security probes are correlatable in the aggregator.
+        log.warn("Disallowed program rejected", {
+          uid: req.firebaseUid,
+          senderPublicKey: senderPubKeyStr,
+          programId,
+        });
         return res.status(400).json({
           error: `Instruction targets a disallowed program: ${programId}. Only SPL Token transfers are permitted.`,
         });
@@ -259,8 +326,7 @@ export async function sponsorTransaction(req, res, next) {
       });
     }
 
-    const sigsValid = tx.verifySignatures(false);
-    if (!sigsValid) {
+    if (!tx.verifySignatures(false)) {
       return res.status(400).json({
         error:
           "Sender signature verification failed. The transaction may have been tampered with.",
@@ -271,41 +337,57 @@ export async function sponsorTransaction(req, res, next) {
 
     tx.partialSign(feePayer);
 
-    const rawTx = tx.serialize();
-
-    const signature = await connection.sendRawTransaction(rawTx, {
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
       skipPreflight: false,
       preflightCommitment: "confirmed",
       maxRetries: 3,
     });
 
-    await pollForConfirmation(
-      signature,
-      txBlockhash,
-      lastValidBlockHeight,
-      "confirmed",
-    );
+    await pollForConfirmation(signature, txBlockhash, "confirmed");
 
-    console.log(
-      `[sponsor] ✓ uid=${req.firebaseUid} sender=${senderPubKeyStr} sig=${signature}`,
-    );
+    log.info("Transaction sponsored", {
+      uid: req.firebaseUid,
+      senderPublicKey: senderPubKeyStr,
+      signature,
+      ixCount: tx.instructions.length,
+      durationMs: Date.now() - startMs,
+    });
 
     return res.status(200).json({ signature });
   } catch (err) {
-    if (
-      err.message?.includes("blockhash expired") ||
-      err.message?.includes("Rebuild and resubmit") ||
-      err.message?.includes("BlockhashNotFound")
-    ) {
+    const durationMs = Date.now() - startMs;
+
+    if (err instanceof BlockhashExpiredError) {
       return res.status(502).json({ error: err.message });
     }
 
-    if (err.message?.includes("Confirmation timeout")) {
+    if (err instanceof ConfirmationTimeoutError) {
+      log.warn("Confirmation timeout", { uid: req.firebaseUid, durationMs });
       return res.status(504).json({ error: err.message });
     }
 
+    if (err instanceof OnChainError) {
+      // Log the raw Solana error server-side for debugging.
+      // Send only a generic message to the client — status.err can expose
+      // instruction indices and program internals that aid attackers.
+      log.error("On-chain transaction failure", {
+        uid: req.firebaseUid,
+        durationMs,
+        solanaErr: JSON.stringify(err.solanaErr),
+      });
+      return res.status(400).json({
+        error:
+          "Transaction was rejected by the network. Check your balances and try again.",
+      });
+    }
+
+    // InsufficientFundsForFee surfaces as a SendTransactionError from the SDK —
+    // string-match is the only option here since it's not our own error type.
     if (err.message?.includes("InsufficientFundsForFee")) {
-      console.error("[sponsor] Fee payer wallet is out of SOL!");
+      log.error("Fee payer wallet is out of SOL — top up urgently", {
+        uid: req.firebaseUid,
+        feePayerPublicKey,
+      });
       return res.status(503).json({
         error: "Service temporarily unavailable. Please try again shortly.",
       });
